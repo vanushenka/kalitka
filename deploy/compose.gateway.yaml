@@ -1,0 +1,21 @@
+name: kalitka-gateway
+
+services:
+  gateway:
+    image: kalitka
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["gateway", "run"]
+    restart: unless-stopped
+    # amneziawg-go runs as a background child of awg-quick and needs an init to reap it.
+    init: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - state:/var/lib/kalitka
+
+volumes:
+  state:

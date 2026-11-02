@@ -1,0 +1,76 @@
+# A gateway behind NAT and a portal on a "public" network. The gateway's default
+# route goes through the nat container, as on a home network, and the portal has no
+# way to the gateway except the NAT mapping. run.sh asserts both.
+#
+# The nat container routes between two Docker networks, which Docker blocks by
+# default: with bridge-nf-call-iptables=1 a frame crossing a bridge passes the host's
+# iptables, even though it stays on that bridge. So the network options below are
+# needed for the frames to reach the nat container at all.
+name: kalitka-trunk-test
+
+x-node: &node
+  image: kalitka:test
+  init: true
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+
+services:
+  portal:
+    <<: *node
+    command: ["portal", "run"]
+    networks:
+      public:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - portal-state:/var/lib/kalitka
+
+  nat:
+    image: kalitka:test
+    init: true
+    entrypoint:
+      - sh
+      - -c
+      - iptables -t nat -A POSTROUTING -s 172.30.1.0/24 ! -d 172.30.1.0/24 -j MASQUERADE && exec sleep infinity
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    networks:
+      public:
+        ipv4_address: 172.30.0.2
+      private:
+        ipv4_address: 172.30.1.2
+
+  gateway:
+    <<: *node
+    entrypoint:
+      - sh
+      - -c
+      - ip route replace default via 172.30.1.2 && exec kalitka gateway run
+    networks:
+      private:
+        ipv4_address: 172.30.1.10
+    volumes:
+      - gateway-state:/var/lib/kalitka
+
+networks:
+  public:
+    # The default mode drops packets addressed to a container here unless they enter
+    # through this network's own bridge (a DROP rule in raw PREROUTING).
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: nat-unprotected
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  # Not internal: on an internal network Docker drops frames addressed outside the
+  # subnet, and a gateway's frames to the portal are exactly that.
+  private:
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+
+volumes:
+  portal-state:
+  gateway-state:

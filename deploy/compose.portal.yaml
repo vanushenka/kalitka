@@ -1,0 +1,23 @@
+name: kalitka-portal
+
+services:
+  portal:
+    image: kalitka
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["portal", "run"]
+    restart: unless-stopped
+    # amneziawg-go runs as a background child of awg-quick and needs an init to reap it.
+    init: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "${KALITKA_TRUNK_PORT:?set KALITKA_TRUNK_PORT to the UDP port gateways dial}:${KALITKA_TRUNK_PORT}/udp"
+    volumes:
+      - state:/var/lib/kalitka
+
+volumes:
+  state:
