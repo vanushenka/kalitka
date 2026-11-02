@@ -1,15 +1,19 @@
 package awg
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"log/slog"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/tuntest"
 )
 
 func TestPublicKeyMatchesRFC7748(t *testing.T) {
@@ -51,8 +55,8 @@ func TestValidateKeyRejects(t *testing.T) {
 		"line break": valid[:20] + "\n" + valid[21:],
 		"trailing":   valid + "\n",
 		"not base64": strings.Repeat("!", 43) + "=",
-		// awg refuses non-zero trailing bits; a lax decoder would let this through and
-		// leave a trunk that can never come up.
+		// The upstream tools refuse non-zero trailing bits, and a client's app uses them;
+		// a lax decoder would let through a key that a peer can never load.
 		"non-canonical": strings.Repeat("A", 42) + "B=",
 	} {
 		if err := ValidateKey(key); err == nil {
@@ -108,7 +112,7 @@ func TestParamsValidateRejects(t *testing.T) {
 		"init and response": func(p *Params) { p.S1, p.S2 = 20, 76 },
 		"response, cookie":  func(p *Params) { p.S2, p.S3 = 15, 43 },
 		"data collision":    func(p *Params) { p.S1, p.S2, p.S3, p.S4 = 15, 15, 12, 19 },
-		"I1 adds a line":    func(p *Params) { p.I1 += "\nPostUp = id" },
+		"I1 adds a line":    func(p *Params) { p.I1 += "\nallowed_ip=0.0.0.0/0" },
 		"I1 huge lengths":   func(p *Params) { p.I1 = strings.Repeat("<r 9999>", 7) },
 		"I1 kernel-only":    func(p *Params) { p.I1 = "<c>" },
 		"I1 empty":          func(p *Params) { p.I1 = "" },
@@ -124,64 +128,84 @@ func TestParamsValidateRejects(t *testing.T) {
 	}
 }
 
-func TestRender(t *testing.T) {
+// base64Key turns a key in hex into the form Config holds.
+func base64Key(t *testing.T, hexKey string) string {
+	t.Helper()
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestEngineConfig(t *testing.T) {
+	const (
+		private    = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a"
+		public     = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+		protection = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"
+	)
 	config := Config{
-		PrivateKey: "PRIVATE",
+		PrivateKey: base64Key(t, private),
 		Address:    netip.MustParsePrefix("10.64.0.2/24"),
 		MTU:        1280,
 		Params: Params{
 			Jc: 4, Jmin: 40, Jmax: 90, S1: 15, S2: 16, S3: 17, S4: 18,
 			I1:                  "<r 2><t>",
-			HeaderProtectionKey: "PROTECTION",
+			HeaderProtectionKey: base64Key(t, protection),
 		},
 		Peers: []Peer{{
-			PublicKey:           "PUBLIC",
-			AllowedIPs:          []netip.Prefix{netip.MustParsePrefix("10.64.0.1/32")},
+			PublicKey: base64Key(t, public),
+			AllowedIPs: []netip.Prefix{
+				netip.MustParsePrefix("10.64.0.1/32"),
+				netip.MustParsePrefix("10.64.0.3/32"),
+			},
 			Endpoint:            "203.0.113.10:39743",
 			PersistentKeepalive: 25,
 		}},
 	}
-	want := `[Interface]
-PrivateKey = PRIVATE
-Address = 10.64.0.2/24
-MTU = 1280
-Table = off
-Jc = 4
-Jmin = 40
-Jmax = 90
-S1 = 15
-S2 = 16
-S3 = 17
-S4 = 18
-H1 = 1
-H2 = 2
-H3 = 3
-H4 = 4
-I1 = <r 2><t>
-HeaderProtectionKey = PROTECTION
-ContentPaddingAddition = 32-128
-
-[Peer]
-PublicKey = PUBLIC
-AllowedIPs = 10.64.0.1/32
-Endpoint = 203.0.113.10:39743
-PersistentKeepalive = 25
+	want := `private_key=` + private + `
+jc=4
+jmin=40
+jmax=90
+s1=15
+s2=16
+s3=17
+s4=18
+h1=1
+h2=2
+h3=3
+h4=4
+i1=<r 2><t>
+header_protection_key=` + protection + `
+content_padding_addition=32-128
+public_key=` + public + `
+endpoint=203.0.113.10:39743
+persistent_keepalive_interval=25
+allowed_ip=10.64.0.1/32
+allowed_ip=10.64.0.3/32
 `
-	if got := config.Render(); got != want {
-		t.Errorf("Render:\n%s\nwant:\n%s", got, want)
+	got, err := config.engineConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("engineConfig:\n%s\nwant:\n%s", got, want)
 	}
 }
 
-func TestRenderListeningPeerHasNoEndpoint(t *testing.T) {
-	got := Config{
-		ListenPort: 39743,
-		Peers:      []Peer{{PublicKey: "PUBLIC"}},
-	}.Render()
-	if !strings.Contains(got, "ListenPort = 39743\n") {
-		t.Errorf("no ListenPort in:\n%s", got)
+func TestEngineConfigListeningPeerHasNoEndpoint(t *testing.T) {
+	config := validConfig()
+	config.ListenPort = 39743
+	config.Peers = []Peer{{PublicKey: GenerateKey()}}
+	got, err := config.engineConfig()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(got, "Endpoint") || strings.Contains(got, "PersistentKeepalive") {
-		t.Errorf("a peer that dials in must have no Endpoint or keepalive:\n%s", got)
+	if !strings.Contains(got, "listen_port=39743\n") {
+		t.Errorf("no listen_port in:\n%s", got)
+	}
+	if strings.Contains(got, "endpoint") || strings.Contains(got, "persistent_keepalive") {
+		t.Errorf("a peer that dials in must have no endpoint or keepalive:\n%s", got)
 	}
 }
 
@@ -200,28 +224,49 @@ func validConfig() Config {
 	}
 }
 
-func TestWriteConf(t *testing.T) {
+// The real engine, on a fake interface, must take every setting it is given and report
+// it back. A misspelled key or a value in the wrong form fails here, with no root needed.
+// A listen_port is left to the end-to-end test: it would bind a real port.
+func TestEngineTakesEverySetting(t *testing.T) {
 	config := validConfig()
-	path, err := WriteConf(t.TempDir(), "trunk0", config)
+	// The engine starts dialling at once, so it dials the loopback's discard port.
+	config.Peers[0].Endpoint = "127.0.0.1:9"
+	settings, err := config.engineConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(path) != "trunk0.conf" {
-		t.Errorf("path %s: awg-quick takes the interface name from the file name", path)
+	engine := device.NewDevice(tuntest.NewChannelTUN().TUN(), conn.NewStdNetBind(), device.NewLogger(device.LogLevelSilent, ""))
+	defer engine.Close()
+	if err := engine.IpcSet(settings); err != nil {
+		t.Fatalf("the engine refused the config: %v\n%s", err, settings)
 	}
-	data, err := os.ReadFile(path)
+	state, err := engine.IpcGet()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != config.Render() {
-		t.Errorf("wrote:\n%s", data)
+	reported := make(map[string]bool)
+	for _, line := range strings.Split(state, "\n") {
+		reported[line] = true
+	}
+	for _, line := range strings.Split(strings.TrimSpace(settings), "\n") {
+		if !reported[line] {
+			key, _, _ := strings.Cut(line, "=")
+			t.Errorf("the engine did not report the setting %s", key)
+		}
+	}
+	handshakes, err := parseHandshakes(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := handshakes[config.Peers[0].PublicKey]; !ok || !got.Equal(time.Unix(0, 0)) {
+		t.Errorf("handshakes %v: want the peer with no handshake yet", handshakes)
 	}
 }
 
-// State read from disk reaches awg-quick through WriteConf alone, so it must refuse
+// State read from disk reaches the engine through NewTunnel alone, so it must refuse
 // whatever could add a line to the config.
-func TestWriteConfRejects(t *testing.T) {
-	const line = "\nPostUp = id"
+func TestNewTunnelRejects(t *testing.T) {
+	const line = "\nallowed_ip=0.0.0.0/0"
 	for name, change := range map[string]func(*Config){
 		"private key":   func(c *Config) { c.PrivateKey += line },
 		"no address":    func(c *Config) { c.Address = netip.Prefix{} },
@@ -236,35 +281,64 @@ func TestWriteConfRejects(t *testing.T) {
 	} {
 		config := validConfig()
 		change(&config)
-		dir := t.TempDir()
-		if _, err := WriteConf(dir, "trunk0", config); err == nil {
+		if _, err := NewTunnel("trunk0", config, slog.Default()); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
-		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-			t.Errorf("%s: wrote a file anyway", name)
-		}
 	}
-	for _, iface := range []string{"", "../trunk0", "trunk0\nPostUp", "a-name-of-16-chr"} {
-		if _, err := WriteConf(t.TempDir(), iface, validConfig()); err == nil {
+	for _, iface := range []string{"", "../trunk0", "trunk0\nline", "a-name-of-16-chr"} {
+		if _, err := NewTunnel(iface, validConfig(), slog.Default()); err == nil {
 			t.Errorf("accepted interface name %q", iface)
 		}
+	}
+	if _, err := NewTunnel("trunk0", validConfig(), slog.Default()); err != nil {
+		t.Errorf("refused a valid config: %v", err)
+	}
+}
+
+func TestResolveEndpoint(t *testing.T) {
+	for endpoint, want := range map[string]string{
+		"203.0.113.10:39743": "203.0.113.10:39743",
+		"[2001:db8::1]:443":  "[2001:db8::1]:443",
+	} {
+		got, err := resolveEndpoint(context.Background(), endpoint)
+		if err != nil {
+			t.Errorf("%s: %v", endpoint, err)
+		}
+		if got != want {
+			t.Errorf("%s: got %s, want %s", endpoint, got, want)
+		}
+	}
+	// The engine takes only an IP, so a name must come back as one. The order of the two
+	// loopback addresses depends on the machine.
+	got, err := resolveEndpoint(context.Background(), "localhost:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, err := netip.ParseAddrPort(got)
+	if err != nil || !address.Addr().IsLoopback() || address.Port() != 443 {
+		t.Errorf("localhost:443: got %q, %v", got, err)
+	}
+	if _, err := resolveEndpoint(context.Background(), "no-port"); err == nil {
+		t.Error("accepted an endpoint without a port")
 	}
 }
 
 func TestValidateEndpoint(t *testing.T) {
 	for endpoint, valid := range map[string]bool{
-		"203.0.113.10:39743":            true,
-		"[2001:db8::1]:443":             true,
-		"portal.example:443":            true,
-		"203.0.113.10":                  false,
-		"203.0.113.10:0":                false,
-		"203.0.113.10:70000":            false,
-		"bad host:443":                  false,
-		"example.com/a:443":             false,
-		"[fe80::1%eth0]:443":            false,
-		"[fe80::1%a\nPostUp = id]:443":  false,
-		"203.0.113.10\nPostUp = id:443": false,
-		"203.0.113.10:443\nPostUp = id": false,
+		"203.0.113.10:39743":               true,
+		"[2001:db8::1]:443":                true,
+		"portal.example:443":               true,
+		"203.0.113.10":                     false,
+		"203.0.113.10:0":                   false,
+		"203.0.113.10:+443":                false,
+		"203.0.113.10:0443":                false,
+		"203.0.113.10:70000":               false,
+		"bad host:443":                     false,
+		"example.com/a:443":                false,
+		"[fe80::1%eth0]:443":               false,
+		"[fe80::1%a\nallowed_ip=0/0]:443":  false,
+		"203.0.113.10\nallowed_ip=0/0:443": false,
+		"203.0.113.10:443\nallowed_ip=0/0": false,
 	} {
 		if err := ValidateEndpoint(endpoint); (err == nil) != valid {
 			t.Errorf("%q: got %v, want valid=%v", endpoint, err, valid)
@@ -273,17 +347,27 @@ func TestValidateEndpoint(t *testing.T) {
 }
 
 func TestParseHandshakes(t *testing.T) {
-	got, err := parseHandshakes("KEY1\t1700000000\nKEY2\t0\n")
+	first, second := strings.Repeat("01", keySize), strings.Repeat("02", keySize)
+	state := "private_key=" + strings.Repeat("aa", keySize) + "\nlisten_port=0\n" +
+		"public_key=" + first + "\nlast_handshake_time_sec=1700000000\nlast_handshake_time_nsec=5\nallowed_ip=10.64.0.1/32\n" +
+		"public_key=" + second + "\nlast_handshake_time_sec=0\nlast_handshake_time_nsec=0\n"
+	got, err := parseHandshakes(state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got["KEY1"].Equal(time.Unix(1700000000, 0)) || !got["KEY2"].Equal(time.Unix(0, 0)) || len(got) != 2 {
+	firstKey, secondKey := base64Key(t, first), base64Key(t, second)
+	if !got[firstKey].Equal(time.Unix(1700000000, 0)) || !got[secondKey].Equal(time.Unix(0, 0)) || len(got) != 2 {
 		t.Errorf("got %v", got)
 	}
-	if got, err := parseHandshakes(""); err != nil || len(got) != 0 {
+	if got, err := parseHandshakes("listen_port=0\n"); err != nil || len(got) != 0 {
 		t.Errorf("no peers: got %v, %v", got, err)
 	}
-	for _, bad := range []string{"KEY1 1700000000", "KEY1\tsoon"} {
+	for _, bad := range []string{
+		"public_key=not-hex\n",
+		"public_key=0102\n",
+		"public_key=" + first + "\nlast_handshake_time_sec=soon\n",
+		"last_handshake_time_sec=1700000000\n",
+	} {
 		if _, err := parseHandshakes(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}

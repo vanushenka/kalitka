@@ -23,7 +23,7 @@ var (
 
 // signatureFormat is the exact shape newSignaturePacket builds: one or two answers
 // give a 37 or 53-byte tail. It is also what bounds the size of I1, so a hostile
-// invite cannot pass huge lengths to the engine or to a kernel module on the host.
+// invite cannot pass huge lengths to the engine.
 var signatureFormat = regexp.MustCompile(`^<r 2><b 0x85800001000[12]00000000[0-9a-f]{2}><rc [2-6][0-9]><b 0x([0-9a-f]{74}|[0-9a-f]{106})>$`)
 
 type intRange struct{ lo, hi int }
@@ -75,8 +75,8 @@ func NewParams() Params {
 }
 
 // Validate accepts only what NewParams can generate. Params can arrive from another
-// machine inside an invite, and the values are written to a config that awg-quick
-// parses, so a value must not be able to add a line such as PostUp to it.
+// machine inside an invite, and the values are written to the engine's line-based
+// config, so a value must not be able to add a line such as allowed_ip to it.
 func (p Params) Validate() error {
 	for _, field := range []struct {
 		name  string

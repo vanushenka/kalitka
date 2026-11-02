@@ -1,6 +1,6 @@
-# A gateway behind NAT and a portal on a "public" network. The gateway's default
-# route goes through the nat container, as on a home network, and the portal has no
-# way to the gateway except the NAT mapping. run.sh asserts both.
+# A gateway behind NAT and two portals on a "public" network. The gateway's default
+# route goes through the nat container, as on a home network, and a portal has no way
+# to the gateway except the NAT mapping. run.sh asserts both.
 #
 # The nat container routes between two Docker networks, which Docker blocks by
 # default: with bridge-nf-call-iptables=1 a frame crossing a bridge passes the host's
@@ -15,6 +15,9 @@ x-tunnel-host: &tunnel-host
     - NET_ADMIN
   devices:
     - /dev/net/tun:/dev/net/tun
+  # Opens the socket that the awg tool reads, and exercises the engine's verbose log.
+  environment:
+    KALITKA_DEBUG: "1"
 
 services:
   portal:
@@ -25,6 +28,15 @@ services:
         ipv4_address: 172.30.0.10
     volumes:
       - portal-state:/var/lib/kalitka
+
+  portal2:
+    <<: *tunnel-host
+    command: ["portal", "run"]
+    networks:
+      public:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - portal2-state:/var/lib/kalitka
 
   nat:
     image: kalitka:test
@@ -49,9 +61,7 @@ services:
       - sh
       - -c
       - ip route replace default via 172.30.1.2 && exec kalitka gateway run
-    environment:
-      LOG_LEVEL: debug
-    # A hostname, so that the path that resolves a portal's name again is exercised.
+    # A hostname, so that the path that resolves a portal's name is exercised.
     extra_hosts:
       - portal.example:172.30.0.10
     networks:
@@ -78,4 +88,5 @@ networks:
 
 volumes:
   portal-state:
+  portal2-state:
   gateway-state:

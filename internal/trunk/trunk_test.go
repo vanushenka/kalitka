@@ -39,7 +39,7 @@ func TestNewPortalRejects(t *testing.T) {
 	}{
 		{"bad name!", "203.0.113.10", 39743},
 		{"msk", "bad host", 39743},
-		{"msk", "203.0.113.10\nPostUp = id", 39743},
+		{"msk", "203.0.113.10\nallowed_ip=0.0.0.0/0", 39743},
 		{"msk", "203.0.113.10", 0},
 		{"msk", "203.0.113.10", 70000},
 	} {
@@ -86,7 +86,7 @@ func TestDecodeInviteRejectsUnknownFields(t *testing.T) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		t.Fatal(err)
 	}
-	fields["post_up"] = "id"
+	fields["allowed_ips"] = "0.0.0.0/0"
 	data, err = json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
@@ -96,11 +96,11 @@ func TestDecodeInviteRejectsUnknownFields(t *testing.T) {
 	}
 }
 
-// A portal is not trusted, and awg-quick runs PostUp lines as commands, so no field
-// of an invite may be able to add a line to the gateway's config. Nor may it take over
-// the gateway's routing or switch the protection off.
+// A portal is not trusted, so no field of an invite may be able to add a line to the
+// engine's config on the gateway, such as a peer's allowed_ip. Nor may it take over the
+// gateway's routing or switch the protection off.
 func TestDecodeInviteRejectsHostileFields(t *testing.T) {
-	const line = "\nPostUp = id"
+	const line = "\nallowed_ip=0.0.0.0/0"
 	for name, change := range map[string]func(*Invite){
 		"name":             func(i *Invite) { i.Portal += line },
 		"no endpoint":      func(i *Invite) { i.Endpoint = "" },

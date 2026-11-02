@@ -4,28 +4,25 @@ package awg
 
 import (
 	"errors"
+	"io"
+	"log/slog"
+	"net/netip"
 	"runtime"
-	"time"
+
+	"github.com/amnezia-vpn/amneziawg-go/v3/device"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 )
 
-// Everything except running a tunnel works on any OS. A port replaces this file
-// with one that drives the platform's AmneziaWG tools.
+// Everything except running a tunnel works on any OS.
 var errUnsupported = errors.New("running a tunnel is not supported on " + runtime.GOOS + " yet")
 
-// CheckTools fails: there are no tools to drive on this OS yet.
-func CheckTools() error { return errUnsupported }
+// CheckSystem fails: this OS cannot run a tunnel yet.
+func CheckSystem() error { return errUnsupported }
 
-// Up is not implemented on this OS.
-func Up(string) error { return errUnsupported }
+func createInterface(string, int) (tun.Device, error) { return nil, errUnsupported }
 
-// Down is not implemented on this OS.
-func Down(string) error { return errUnsupported }
+func configureInterface(string, netip.Prefix) error { return errUnsupported }
 
-// InterfaceExists is not implemented on this OS.
-func InterfaceExists(string) bool { return false }
-
-// LatestHandshakes is not implemented on this OS.
-func LatestHandshakes(string) (map[string]time.Time, error) { return nil, errUnsupported }
-
-// SetEndpoint is not implemented on this OS.
-func SetEndpoint(string, string, string) error { return errUnsupported }
+func openControl(string, *device.Device, *slog.Logger) (io.Closer, error) {
+	return nil, errUnsupported
+}

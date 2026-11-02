@@ -7,7 +7,8 @@ protocols.
 | Read | When |
 |---|---|
 | `docs/architecture.md`, section Stages | Before starting work: what is done, what comes next |
-| `docs/architecture.md`, section Principles | Before changing `internal/` or `deploy/` |
+| `docs/architecture.md`, section Principles | Before changing `internal/` |
+| `docs/architecture.md`, section How a gateway will release traffic | Before changing how traffic leaves a gateway: what was measured and why |
 | `docs/architecture.md`, section Open questions | Before settling trunk MTU, engine speed or the spare trunk |
 | `README.md`, section Develop | For the build and test commands |
 
@@ -20,28 +21,31 @@ mislead.
 
 ## Must keep
 
-- **A portal is not trusted.** An invite comes from a portal, and `awg-quick` runs
-  `PostUp` lines from the gateway's config as commands. A new invite field gets strict
-  validation in `Invite.Validate` and a case in `TestDecodeInviteRejectsHostileFields`.
+- **A portal is not trusted.** An invite comes from a portal, and its values reach the
+  engine's line-based config on the gateway. A new invite field gets strict validation
+  in `Invite.Validate` and a case in `TestDecodeInviteRejectsHostileFields`.
 - **An unreachable portal is a normal state.** The gateway keeps trying, and one portal
   never affects another trunk.
 - **The AmneziaWG profile is measured, not designed.** `awg.NewParams` follows the
   upstream installer; values that look odd are deliberate. Change them only with a
   measurement behind the change.
-- **All ends run one AmneziaWG generation.** Engine versions are pinned in
-  `deploy/Dockerfile`, because generations do not interoperate and a gateway abroad may
-  be impossible to reach after a bad upgrade.
-- **Names stay neutral.** Process, image, container and interface names carry no "vpn",
-  "proxy" or "bypass": they are visible to whoever hosts a portal.
+- **All ends run one AmneziaWG generation.** The engine's version is pinned in `go.mod`,
+  because generations do not interoperate and a gateway abroad may be impossible to
+  reach after a bad upgrade. The `awg` tool pinned in `test/trunk/Dockerfile` is only a
+  witness for the test.
+- **Docker is not part of the product.** It stays in `test/`. A complex dependency has to
+  give a real benefit: being already installed on a machine is no reason.
+- **Names stay neutral.** Process and interface names carry no "vpn", "proxy" or
+  "bypass": they are visible to whoever hosts a portal.
 - **The repository is public.** No real addresses, locations, keys or names of the
   machines in use, in code, docs, tests or commit messages. Examples use `203.0.113.0/24`
   and `.example` hostnames.
-- **Standard library only so far.** A new Go dependency needs a stated reason.
+- **The engine is the only Go dependency.** A new one needs a stated reason.
 
 ## Testing
 
-- Run `test/trunk/run.sh` after changing `internal/`, `deploy/` or an engine version. Unit
-  tests do not prove that a tunnel comes up.
+- Run `test/trunk/run.sh` after changing `internal/` or the engine's version. Unit tests
+  do not prove that a tunnel comes up.
 - A pass means a trunk works in containers on one machine. It says nothing about real
   networks or filtering, and it does not cover publishing a port on a real portal.
 - From Windows, run both in WSL. `wsl.exe` expands `$VAR` in its arguments before Linux
@@ -50,7 +54,7 @@ mislead.
 ## Ask first
 
 Where the client VPN ends (options A and B in `docs/architecture.md`) has not been
-decided, and stage 2 needs that decision. Do not choose it on your own.
+decided, and stage 3 needs that decision. Do not choose it on your own.
 
 ## Docs
 

@@ -64,10 +64,9 @@ func DecodeInvite(s string) (Invite, error) {
 }
 
 // Validate accepts only what a portal generates. The invite is written by a portal,
-// which Kalitka does not trust, and its values reach a config on the gateway that
-// awg-quick parses and whose PostUp lines it runs as commands. A compromised portal
-// must not be able to run anything on the gateway through an invite, or to pick
-// subnets that would capture the gateway's traffic to other portals.
+// which Kalitka does not trust, and its values reach the engine's line-based config on
+// the gateway. A compromised portal must not be able to add a setting there through an
+// invite, or to pick subnets that would capture the gateway's traffic to other portals.
 func (i Invite) Validate() error {
 	if !nameFormat.MatchString(i.Portal) {
 		return fmt.Errorf("portal name %q is not valid", i.Portal)

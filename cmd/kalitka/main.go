@@ -29,9 +29,15 @@ A running portal or gateway loads its state at start: restart it after
 "portal invite" or "gateway join".
 
 State lives in $KALITKA_STATE (default /var/lib/kalitka) and holds private keys.
+
+With KALITKA_DEBUG=1 a running portal or gateway logs what the engine does and opens
+the socket that the upstream "awg show" reads.
 `
 
 func main() {
+	if os.Getenv("KALITKA_DEBUG") != "" {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
 	if err := dispatch(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "kalitka:", err)
 		os.Exit(1)
@@ -166,7 +172,7 @@ func gatewayRun(args []string) error {
 func runTunnels(tunnels []trunk.Tunnel) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return trunk.Run(ctx, statePath("run"), tunnels, slog.Default())
+	return trunk.Run(ctx, tunnels, slog.Default())
 }
 
 func parseFlags(flags *flag.FlagSet, args []string) error {

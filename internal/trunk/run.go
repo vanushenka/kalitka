@@ -3,10 +3,8 @@ package trunk
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/netip"
-	"os"
 	"sync"
 	"time"
 
@@ -22,72 +20,59 @@ const (
 
 // Run keeps the tunnels up until ctx ends, then removes them. A portal that cannot
 // be reached is a normal state, so Run keeps trying and never gives up on it. What
-// retrying cannot cure, missing tools or an invalid config, fails here at the start.
-func Run(ctx context.Context, runDir string, tunnels []Tunnel, log *slog.Logger) error {
+// retrying cannot cure, a system that cannot run a tunnel or an invalid config, fails
+// here at the start.
+func Run(ctx context.Context, tunnels []Tunnel, log *slog.Logger) error {
 	if len(tunnels) == 0 {
 		return errors.New("nothing to run: no trunks are configured")
 	}
-	if err := awg.CheckTools(); err != nil {
+	if err := awg.CheckSystem(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(runDir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", runDir, err)
-	}
-	paths := make([]string, len(tunnels))
+	engines := make([]*awg.Tunnel, len(tunnels))
 	for i, tunnel := range tunnels {
-		path, err := awg.WriteConf(runDir, tunnel.Interface, tunnel.Config)
+		engine, err := awg.NewTunnel(tunnel.Interface, tunnel.Config, log.With("interface", tunnel.Interface))
 		if err != nil {
 			return err
 		}
-		paths[i] = path
+		engines[i] = engine
 	}
 	var group sync.WaitGroup
 	for i, tunnel := range tunnels {
 		group.Go(func() {
-			supervise(ctx, tunnel, paths[i], log.With("interface", tunnel.Interface))
+			supervise(ctx, tunnel, engines[i], log.With("interface", tunnel.Interface))
 		})
 	}
 	group.Wait()
 	return nil
 }
 
-func supervise(ctx context.Context, tunnel Tunnel, confPath string, log *slog.Logger) {
+func supervise(ctx context.Context, tunnel Tunnel, engine *awg.Tunnel, log *slog.Logger) {
 	up := false
 	connected := make(map[string]bool)
 	for {
 		if !up {
-			up = bringUp(tunnel.Interface, confPath, log)
+			up = bringUp(ctx, engine, log)
 			clear(connected)
 		}
 		if up {
-			if err := check(tunnel, connected, time.Now(), log); err != nil {
-				// The interface is gone, for example amneziawg-go has exited.
+			if err := check(ctx, tunnel, engine, connected, time.Now(), log); err != nil {
 				log.Error("tunnel lost, bringing it up again", "error", err)
+				engine.Down()
 				up = false
 			}
 		}
 		select {
 		case <-ctx.Done():
-			if up {
-				if err := awg.Down(confPath); err != nil {
-					log.Error("removing the tunnel failed", "error", err)
-				}
-			}
+			engine.Down()
 			return
 		case <-time.After(checkInterval):
 		}
 	}
 }
 
-func bringUp(iface, confPath string, log *slog.Logger) bool {
-	if awg.InterfaceExists(iface) {
-		log.Warn("removing an interface left from an earlier run")
-		if err := awg.Down(confPath); err != nil {
-			log.Error("removing the old interface failed", "error", err)
-			return false
-		}
-	}
-	if err := awg.Up(confPath); err != nil {
+func bringUp(ctx context.Context, engine *awg.Tunnel, log *slog.Logger) bool {
+	if err := engine.Up(ctx); err != nil {
 		log.Error("bringing the tunnel up failed, will retry", "error", err)
 		return false
 	}
@@ -95,8 +80,8 @@ func bringUp(iface, confPath string, log *slog.Logger) bool {
 	return true
 }
 
-func check(tunnel Tunnel, connected map[string]bool, now time.Time, log *slog.Logger) error {
-	handshakes, err := awg.LatestHandshakes(tunnel.Interface)
+func check(ctx context.Context, tunnel Tunnel, engine *awg.Tunnel, connected map[string]bool, now time.Time, log *slog.Logger) error {
+	handshakes, err := engine.LatestHandshakes()
 	if err != nil {
 		return err
 	}
@@ -111,8 +96,8 @@ func check(tunnel Tunnel, connected map[string]bool, now time.Time, log *slog.Lo
 			}
 		}
 		if !alive && endpointNeedsResolving(peer.Endpoint) {
-			// A portal on a dynamic IP may have moved; awg-quick resolved its name only once.
-			if err := awg.SetEndpoint(tunnel.Interface, peer.PublicKey, peer.Endpoint); err != nil {
+			// A portal on a dynamic IP may have moved since its name was last resolved.
+			if err := engine.SetEndpoint(ctx, peer.PublicKey, peer.Endpoint); err != nil {
 				log.Warn("resolving the portal again failed", "endpoint", peer.Endpoint, "error", err)
 			}
 		}

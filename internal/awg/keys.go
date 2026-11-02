@@ -1,12 +1,12 @@
-// Package awg generates AmneziaWG configuration and drives the upstream tools.
-// The protocol itself is amneziawg-go and amneziawg-tools; nothing here
-// reimplements it.
+// Package awg generates AmneziaWG configuration and runs the upstream engine,
+// amneziawg-go, inside this process. Nothing here reimplements the protocol.
 package awg
 
 import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 )
@@ -14,10 +14,10 @@ import (
 const keySize = 32
 
 var (
-	// keyFormat refuses line breaks, which even the strict base64 decoder skips. Keys
-	// end up in a config that awg-quick parses, so a line break must not get through.
+	// keyFormat refuses line breaks, which even the strict base64 decoder skips.
 	keyFormat = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
-	// keyEncoding refuses non-zero trailing bits, as awg does.
+	// keyEncoding refuses non-zero trailing bits. Peers using other WireGuard tools
+	// would refuse such a key.
 	keyEncoding = base64.StdEncoding.Strict()
 	zeroKey     = keyEncoding.EncodeToString(make([]byte, keySize))
 )
@@ -44,10 +44,19 @@ func PublicKey(private string) (string, error) {
 	return keyEncoding.EncodeToString(key.PublicKey().Bytes()), nil
 }
 
-// ValidateKey checks that s is a base64 key that awg will accept.
+// ValidateKey checks that s is a canonical base64 key.
 func ValidateKey(s string) error {
 	_, err := decodeKey(s)
 	return err
+}
+
+// keyHex converts a key to the form the engine's config takes.
+func keyHex(s string) (string, error) {
+	raw, err := decodeKey(s)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 func decodeKey(s string) ([]byte, error) {
