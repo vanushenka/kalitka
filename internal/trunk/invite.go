@@ -4,26 +4,18 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"kalitka/internal/awg"
 )
 
-const (
-	invitePrefix = "kalitka1."
-	minMTU       = 1280
-	maxMTU       = 1500
-)
+const invitePrefix = "kalitka1."
 
-var (
-	nameFormat = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$`)
-	hostFormat = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$`)
-)
+var nameFormat = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,31}$`)
 
 // Invite is everything a gateway needs to dial a portal. It holds the gateway's
 // private key for this one trunk, so there is no second step sending a key back,
@@ -71,55 +63,44 @@ func DecodeInvite(s string) (Invite, error) {
 	return invite, nil
 }
 
-// Validate checks every field strictly. The invite is written by a portal, which
-// Kalitka does not trust, and its values reach a config on the gateway that
+// Validate accepts only what a portal generates. The invite is written by a portal,
+// which Kalitka does not trust, and its values reach a config on the gateway that
 // awg-quick parses and whose PostUp lines it runs as commands. A compromised portal
-// must not be able to run anything on the gateway through an invite.
+// must not be able to run anything on the gateway through an invite, or to pick
+// subnets that would capture the gateway's traffic to other portals.
 func (i Invite) Validate() error {
 	if !nameFormat.MatchString(i.Portal) {
 		return fmt.Errorf("portal name %q is not valid", i.Portal)
 	}
-	if err := validateEndpoint(i.Endpoint); err != nil {
-		return err
+	if i.Endpoint == "" {
+		return errors.New("no endpoint")
 	}
-	if err := awg.ValidateKey(i.PortalPublicKey); err != nil {
-		return fmt.Errorf("portal public key: %w", err)
+	if i.Subnet.Bits() != subnetBits || !subnetRange.Contains(i.Subnet.Addr()) || i.Subnet != i.Subnet.Masked() {
+		return fmt.Errorf("subnet %v is not a /%d in %v", i.Subnet, subnetBits, subnetRange)
 	}
-	if err := awg.ValidateKey(i.PrivateKey); err != nil {
-		return fmt.Errorf("private key: %w", err)
+	if !i.Subnet.Contains(i.Address) {
+		return fmt.Errorf("address %v is not in %v", i.Address, i.Subnet)
 	}
-	if !i.Subnet.IsValid() || !i.Subnet.Addr().Is4() || !i.Subnet.Addr().IsPrivate() || i.Subnet != i.Subnet.Masked() {
-		return fmt.Errorf("subnet %v is not a private IPv4 network", i.Subnet)
+	// .1 is the portal's own address; .0 and .255 are not host addresses.
+	if host := i.Address.As4()[3]; host < 2 || host == 255 {
+		return fmt.Errorf("address %v is not a gateway address", i.Address)
 	}
-	if !i.Subnet.Contains(i.Address) || i.Address == portalAddress(i.Subnet) {
-		return fmt.Errorf("address %v is not a gateway address in %v", i.Address, i.Subnet)
-	}
-	if i.MTU < minMTU || i.MTU > maxMTU {
-		return fmt.Errorf("MTU %d is outside %d-%d", i.MTU, minMTU, maxMTU)
-	}
-	if err := i.Params.Validate(); err != nil {
-		return fmt.Errorf("params: %w", err)
-	}
-	return nil
+	return i.config().Validate()
 }
 
-// validateEndpoint checks a host:port. A zone is refused because netip accepts any
-// text after the % sign, line breaks included.
-func validateEndpoint(endpoint string) error {
-	host, port, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		return fmt.Errorf("endpoint %q: %w", endpoint, err)
+// config is the gateway's end of the trunk this invite describes.
+func (i Invite) config() awg.Config {
+	portal := portalAddress(i.Subnet)
+	return awg.Config{
+		PrivateKey: i.PrivateKey,
+		Address:    netip.PrefixFrom(i.Address, i.Subnet.Bits()),
+		MTU:        i.MTU,
+		Params:     i.Params,
+		Peers: []awg.Peer{{
+			PublicKey:           i.PortalPublicKey,
+			AllowedIPs:          []netip.Prefix{netip.PrefixFrom(portal, portal.BitLen())},
+			Endpoint:            i.Endpoint,
+			PersistentKeepalive: keepalive,
+		}},
 	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		if addr.Zone() != "" {
-			return fmt.Errorf("endpoint %q has an address zone", endpoint)
-		}
-	} else if !hostFormat.MatchString(host) {
-		return fmt.Errorf("endpoint %q has an invalid host", endpoint)
-	}
-	number, err := strconv.Atoi(port)
-	if err != nil || number < 1 || number > 65535 {
-		return fmt.Errorf("endpoint %q has an invalid port", endpoint)
-	}
-	return nil
 }

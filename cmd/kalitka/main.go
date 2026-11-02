@@ -2,10 +2,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -20,7 +22,7 @@ const usage = `Usage:
   kalitka portal init --host HOST --port PORT [--name NAME]
   kalitka portal invite --gateway NAME
   kalitka portal run
-  kalitka gateway join INVITE
+  kalitka gateway join          (reads the invite from standard input)
   kalitka gateway run
 
 A running portal or gateway loads its state at start: restart it after
@@ -48,11 +50,11 @@ func dispatch(args []string) error {
 	case "portal invite":
 		return portalInvite(rest)
 	case "portal run":
-		return portalRun()
+		return portalRun(rest)
 	case "gateway join":
 		return gatewayJoin(rest)
 	case "gateway run":
-		return gatewayRun()
+		return gatewayRun(rest)
 	}
 	fmt.Fprint(os.Stderr, usage)
 	return fmt.Errorf("unknown command %q", role+" "+command)
@@ -63,7 +65,7 @@ func portalInit(args []string) error {
 	name := flags.String("name", "portal", "a name for this portal")
 	host := flags.String("host", "", "public IP or hostname gateways dial")
 	port := flags.Int("port", 0, "UDP port gateways dial")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		return err
 	}
 	if *host == "" || *port == 0 {
@@ -85,7 +87,7 @@ func portalInit(args []string) error {
 func portalInvite(args []string) error {
 	flags := flag.NewFlagSet("portal invite", flag.ContinueOnError)
 	gateway := flags.String("gateway", "", "a name for the gateway")
-	if err := flags.Parse(args); err != nil {
+	if err := parseFlags(flags, args); err != nil {
 		return err
 	}
 	if *gateway == "" {
@@ -107,11 +109,16 @@ func portalInvite(args []string) error {
 	if err := trunk.Save(path, &portal); err != nil {
 		return err
 	}
-	fmt.Println(encoded)
+	if _, err := fmt.Println(encoded); err != nil {
+		return fmt.Errorf("gateway %q is registered, but its invite could not be printed: %w", *gateway, err)
+	}
 	return nil
 }
 
-func portalRun() error {
+func portalRun(args []string) error {
+	if err := noArguments(args); err != nil {
+		return err
+	}
 	var portal trunk.Portal
 	if err := trunk.Load(statePath("portal.json"), &portal); err != nil {
 		return err
@@ -119,11 +126,18 @@ func portalRun() error {
 	return runTunnels(portal.Tunnels())
 }
 
+// gatewayJoin reads the invite from standard input: it holds a private key, and an
+// argument would stay in the shell history and show in the process list.
 func gatewayJoin(args []string) error {
-	if len(args) != 1 {
-		return errors.New("exactly one invite is required")
+	if err := noArguments(args); err != nil {
+		return fmt.Errorf("%w: the invite is read from standard input", err)
 	}
-	invite, err := trunk.DecodeInvite(args[0])
+	fmt.Fprintln(os.Stderr, "Paste the invite and press Enter:")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read the invite: %w", err)
+	}
+	invite, err := trunk.DecodeInvite(line)
 	if err != nil {
 		return err
 	}
@@ -138,7 +152,10 @@ func gatewayJoin(args []string) error {
 	return trunk.Save(path, &gateway)
 }
 
-func gatewayRun() error {
+func gatewayRun(args []string) error {
+	if err := noArguments(args); err != nil {
+		return err
+	}
 	var gateway trunk.Gateway
 	if err := trunk.Load(statePath("gateway.json"), &gateway); err != nil {
 		return err
@@ -150,6 +167,20 @@ func runTunnels(tunnels []trunk.Tunnel) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return trunk.Run(ctx, statePath("run"), tunnels, slog.Default())
+}
+
+func parseFlags(flags *flag.FlagSet, args []string) error {
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	return noArguments(flags.Args())
+}
+
+func noArguments(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("unexpected arguments: %q", args)
+	}
+	return nil
 }
 
 func statePath(name string) string {

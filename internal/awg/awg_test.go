@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -49,6 +51,9 @@ func TestValidateKeyRejects(t *testing.T) {
 		"line break": valid[:20] + "\n" + valid[21:],
 		"trailing":   valid + "\n",
 		"not base64": strings.Repeat("!", 43) + "=",
+		// awg refuses non-zero trailing bits; a lax decoder would let this through and
+		// leave a trunk that can never come up.
+		"non-canonical": strings.Repeat("A", 42) + "B=",
 	} {
 		if err := ValidateKey(key); err == nil {
 			t.Errorf("%s: accepted %q", name, key)
@@ -68,15 +73,6 @@ func TestNewParamsHoldsTheProfile(t *testing.T) {
 		}
 		if p.S1 < 15 || p.S1 > 150 || p.S2 < 15 || p.S2 > 150 || p.S3 < 12 || p.S3 > 55 || p.S4 < 12 || p.S4 > 27 {
 			t.Fatalf("paddings out of range: %+v", p)
-		}
-		if p.S2 == p.S1+56 || p.S3 == p.S2+28 {
-			t.Fatalf("handshake sizes match: %+v", p)
-		}
-		if dataSizeCollides(p.S1, p.S2, p.S3, p.S4) {
-			t.Fatalf("data size collides: %+v", p)
-		}
-		if p.H1 != "1" || p.H2 != "2" || p.H3 != "3" || p.H4 != "4" || p.ContentPaddingAddition != "32-128" {
-			t.Fatalf("not the 3.1 profile: %+v", p)
 		}
 		if !i1.MatchString(p.I1) {
 			t.Fatalf("I1 has the wrong shape: %s", p.I1)
@@ -104,16 +100,21 @@ func TestDataSizeCollides(t *testing.T) {
 
 func TestParamsValidateRejects(t *testing.T) {
 	for name, change := range map[string]func(*Params){
-		"Jc too large":        func(p *Params) { p.Jc = maxJunkCount + 1 },
-		"Jmax below Jmin":     func(p *Params) { p.Jmax = p.Jmin - 1 },
-		"S4 below the nonce":  func(p *Params) { p.S4 = minPadding - 1 },
-		"handshake sizes":     func(p *Params) { p.S1, p.S2 = 20, 76 },
-		"H1 adds a line":      func(p *Params) { p.H1 = "1\nPostUp = id" },
-		"I1 adds a line":      func(p *Params) { p.I1 = "<t>\nPostUp = id" },
-		"I1 kernel-only tag":  func(p *Params) { p.I1 = "<c>" },
-		"I1 odd hex":          func(p *Params) { p.I1 = "<b 0xabc>" },
-		"padding adds a line": func(p *Params) { p.ContentPaddingAddition = "32\nPostUp = id" },
-		"protection key":      func(p *Params) { p.HeaderProtectionKey = "short" },
+		"Jc too large":      func(p *Params) { p.Jc = junkCountRange.hi + 1 },
+		"Jmax below Jmin":   func(p *Params) { p.Jmax = p.Jmin - 1 },
+		"Jmax too far":      func(p *Params) { p.Jmax = p.Jmin + junkSpreadRange.hi + 1 },
+		"S4 below nonce":    func(p *Params) { p.S4 = 4 },
+		"S1 too large":      func(p *Params) { p.S1 = 1000 },
+		"init and response": func(p *Params) { p.S1, p.S2 = 20, 76 },
+		"response, cookie":  func(p *Params) { p.S2, p.S3 = 15, 43 },
+		"data collision":    func(p *Params) { p.S1, p.S2, p.S3, p.S4 = 15, 15, 12, 19 },
+		"I1 adds a line":    func(p *Params) { p.I1 += "\nPostUp = id" },
+		"I1 huge lengths":   func(p *Params) { p.I1 = strings.Repeat("<r 9999>", 7) },
+		"I1 kernel-only":    func(p *Params) { p.I1 = "<c>" },
+		"I1 empty":          func(p *Params) { p.I1 = "" },
+		"I1 odd hex":        func(p *Params) { p.I1 = "<r 2><b 0xabc>" },
+		"short key":         func(p *Params) { p.HeaderProtectionKey = "short" },
+		"zero key":          func(p *Params) { p.HeaderProtectionKey = zeroKey },
 	} {
 		p := NewParams()
 		change(&p)
@@ -130,10 +131,8 @@ func TestRender(t *testing.T) {
 		MTU:        1280,
 		Params: Params{
 			Jc: 4, Jmin: 40, Jmax: 90, S1: 15, S2: 16, S3: 17, S4: 18,
-			H1: "1", H2: "2", H3: "3", H4: "4",
-			I1:                     "<r 2><t>",
-			HeaderProtectionKey:    "PROTECTION",
-			ContentPaddingAddition: "32-128",
+			I1:                  "<r 2><t>",
+			HeaderProtectionKey: "PROTECTION",
 		},
 		Peers: []Peer{{
 			PublicKey:           "PUBLIC",
@@ -183,6 +182,93 @@ func TestRenderListeningPeerHasNoEndpoint(t *testing.T) {
 	}
 	if strings.Contains(got, "Endpoint") || strings.Contains(got, "PersistentKeepalive") {
 		t.Errorf("a peer that dials in must have no Endpoint or keepalive:\n%s", got)
+	}
+}
+
+func validConfig() Config {
+	return Config{
+		PrivateKey: GenerateKey(),
+		Address:    netip.MustParsePrefix("10.64.0.2/24"),
+		MTU:        1280,
+		Params:     NewParams(),
+		Peers: []Peer{{
+			PublicKey:           GenerateKey(),
+			AllowedIPs:          []netip.Prefix{netip.MustParsePrefix("10.64.0.1/32")},
+			Endpoint:            "203.0.113.10:39743",
+			PersistentKeepalive: 25,
+		}},
+	}
+}
+
+func TestWriteConf(t *testing.T) {
+	config := validConfig()
+	path, err := WriteConf(t.TempDir(), "trunk0", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != "trunk0.conf" {
+		t.Errorf("path %s: awg-quick takes the interface name from the file name", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != config.Render() {
+		t.Errorf("wrote:\n%s", data)
+	}
+}
+
+// State read from disk reaches awg-quick through WriteConf alone, so it must refuse
+// whatever could add a line to the config.
+func TestWriteConfRejects(t *testing.T) {
+	const line = "\nPostUp = id"
+	for name, change := range map[string]func(*Config){
+		"private key":   func(c *Config) { c.PrivateKey += line },
+		"no address":    func(c *Config) { c.Address = netip.Prefix{} },
+		"listen port":   func(c *Config) { c.ListenPort = 70000 },
+		"MTU too small": func(c *Config) { c.MTU = minMTU - 1 },
+		"MTU too large": func(c *Config) { c.MTU = maxMTU + 1 },
+		"params":        func(c *Config) { c.Params.I1 += line },
+		"peer key":      func(c *Config) { c.Peers[0].PublicKey += line },
+		"allowed IP":    func(c *Config) { c.Peers[0].AllowedIPs = []netip.Prefix{{}} },
+		"endpoint":      func(c *Config) { c.Peers[0].Endpoint += line },
+		"keepalive":     func(c *Config) { c.Peers[0].PersistentKeepalive = -1 },
+	} {
+		config := validConfig()
+		change(&config)
+		dir := t.TempDir()
+		if _, err := WriteConf(dir, "trunk0", config); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Errorf("%s: wrote a file anyway", name)
+		}
+	}
+	for _, iface := range []string{"", "../trunk0", "trunk0\nPostUp", "a-name-of-16-chr"} {
+		if _, err := WriteConf(t.TempDir(), iface, validConfig()); err == nil {
+			t.Errorf("accepted interface name %q", iface)
+		}
+	}
+}
+
+func TestValidateEndpoint(t *testing.T) {
+	for endpoint, valid := range map[string]bool{
+		"203.0.113.10:39743":            true,
+		"[2001:db8::1]:443":             true,
+		"portal.example:443":            true,
+		"203.0.113.10":                  false,
+		"203.0.113.10:0":                false,
+		"203.0.113.10:70000":            false,
+		"bad host:443":                  false,
+		"example.com/a:443":             false,
+		"[fe80::1%eth0]:443":            false,
+		"[fe80::1%a\nPostUp = id]:443":  false,
+		"203.0.113.10\nPostUp = id:443": false,
+		"203.0.113.10:443\nPostUp = id": false,
+	} {
+		if err := ValidateEndpoint(endpoint); (err == nil) != valid {
+			t.Errorf("%q: got %v, want valid=%v", endpoint, err, valid)
+		}
 	}
 }
 

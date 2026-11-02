@@ -12,6 +12,9 @@ import (
 // with one that drives the platform's AmneziaWG tools.
 var errUnsupported = errors.New("running a tunnel is not supported on " + runtime.GOOS + " yet")
 
+// CheckTools fails: there are no tools to drive on this OS yet.
+func CheckTools() error { return errUnsupported }
+
 // Up is not implemented on this OS.
 func Up(string) error { return errUnsupported }
 

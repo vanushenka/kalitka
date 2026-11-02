@@ -8,73 +8,62 @@ import (
 	"regexp"
 )
 
-const (
-	// maxJunkCount is the installer's ceiling: together with I1-I5 a larger Jc can
-	// overflow the batch of 128 packets and crash amneziawg-go on the first
-	// handshake (amneziawg-go#111).
-	maxJunkCount = 122
-	maxJunkSize  = 1280
-	// minPadding is the header protection nonce size: amneziawg-go rejects a
-	// config with a smaller S1-S4 once HeaderProtectionKey is set.
-	minPadding = 12
-	maxPadding = 1280
-)
-
+// The AmneziaWG 3.1 profile. The ranges and the size rules follow
+// generate_awg_params in bivlked/amneziawg-installer (MIT), to stay within what that
+// project has tried on real networks. S3 and S4 start at 12, the header protection
+// nonce size: amneziawg-go rejects a smaller padding once a protection key is set.
 var (
-	headerFormat  = regexp.MustCompile(`^[0-9]{1,10}(-[0-9]{1,10})?$`)
-	paddingFormat = regexp.MustCompile(`^[0-9]{1,5}(-[0-9]{1,5})?$`)
-	// signatureFormat holds the tags both the kernel module and amneziawg-go
-	// understand; a config with `<c>` does not come up on amneziawg-go.
-	signatureFormat = regexp.MustCompile(`^(<(b 0x([0-9a-fA-F]{2})+|r [0-9]{1,4}|rd [0-9]{1,4}|rc [0-9]{1,4}|t)>)*$`)
+	junkCountRange        = intRange{3, 6}
+	junkMinRange          = intRange{40, 89}
+	junkSpreadRange       = intRange{50, 250} // Jmax - Jmin
+	handshakePaddingRange = intRange{15, 150} // S1, S2
+	cookiePaddingRange    = intRange{12, 55}  // S3
+	transportPaddingRange = intRange{12, 27}  // S4
 )
 
-// Params holds the obfuscation settings of one AmneziaWG 3.1 tunnel. Both ends of
-// a tunnel use the same values.
+// signatureFormat is the exact shape newSignaturePacket builds: one or two answers
+// give a 37 or 53-byte tail. It is also what bounds the size of I1, so a hostile
+// invite cannot pass huge lengths to the engine or to a kernel module on the host.
+var signatureFormat = regexp.MustCompile(`^<r 2><b 0x85800001000[12]00000000[0-9a-f]{2}><rc [2-6][0-9]><b 0x([0-9a-f]{74}|[0-9a-f]{106})>$`)
+
+type intRange struct{ lo, hi int }
+
+func (r intRange) random() int         { return randRange(r.lo, r.hi) }
+func (r intRange) contains(v int) bool { return r.lo <= v && v <= r.hi }
+
+// Params holds the obfuscation settings of one AmneziaWG 3.1 tunnel that differ
+// between tunnels. Both ends of a tunnel use the same values.
 type Params struct {
-	Jc                     int    `json:"jc"`
-	Jmin                   int    `json:"jmin"`
-	Jmax                   int    `json:"jmax"`
-	S1                     int    `json:"s1"`
-	S2                     int    `json:"s2"`
-	S3                     int    `json:"s3"`
-	S4                     int    `json:"s4"`
-	H1                     string `json:"h1"`
-	H2                     string `json:"h2"`
-	H3                     string `json:"h3"`
-	H4                     string `json:"h4"`
-	I1                     string `json:"i1"`
-	HeaderProtectionKey    string `json:"header_protection_key"`
-	ContentPaddingAddition string `json:"content_padding_addition"`
+	Jc                  int    `json:"jc"`
+	Jmin                int    `json:"jmin"`
+	Jmax                int    `json:"jmax"`
+	S1                  int    `json:"s1"`
+	S2                  int    `json:"s2"`
+	S3                  int    `json:"s3"`
+	S4                  int    `json:"s4"`
+	I1                  string `json:"i1"`
+	HeaderProtectionKey string `json:"header_protection_key"`
 }
 
-// NewParams generates an AmneziaWG 3.1 profile. The ranges and the size rules
-// follow generate_awg_params in bivlked/amneziawg-installer (MIT), so the profile
-// stays within what that project has measured on real networks.
+// NewParams generates the settings of a new tunnel.
 func NewParams() Params {
-	jmin := randRange(40, 89)
+	jmin := junkMinRange.random()
 	p := Params{
-		Jc:   randRange(3, 6),
-		Jmin: jmin,
-		Jmax: jmin + randRange(50, 250),
-		S1:   randRange(15, 150),
-		S2:   randRange(15, 150),
-		S3:   randRange(minPadding, 55),
-		// With a header protection key the wire looks random for any H, so random
-		// ranges hide nothing; the values must only not overlap.
-		H1:                     "1",
-		H2:                     "2",
-		H3:                     "3",
-		H4:                     "4",
-		I1:                     newSignaturePacket(),
-		HeaderProtectionKey:    GenerateKey(),
-		ContentPaddingAddition: "32-128",
+		Jc:                  junkCountRange.random(),
+		Jmin:                jmin,
+		Jmax:                jmin + junkSpreadRange.random(),
+		S1:                  handshakePaddingRange.random(),
+		S2:                  handshakePaddingRange.random(),
+		S3:                  cookiePaddingRange.random(),
+		I1:                  newSignaturePacket(),
+		HeaderProtectionKey: GenerateKey(),
 	}
 	for handshakeSizesMatch(p.S1, p.S2, p.S3) {
-		p.S2 = randRange(15, 150)
-		p.S3 = randRange(minPadding, 55)
+		p.S2 = handshakePaddingRange.random()
+		p.S3 = cookiePaddingRange.random()
 	}
 	var free []int
-	for s4 := minPadding; s4 <= 27; s4++ {
+	for s4 := transportPaddingRange.lo; s4 <= transportPaddingRange.hi; s4++ {
 		if !dataSizeCollides(p.S1, p.S2, p.S3, s4) {
 			free = append(free, s4)
 		}
@@ -85,46 +74,51 @@ func NewParams() Params {
 	return p
 }
 
-// Validate checks every field. Params can arrive from another machine inside an
-// invite, and the values are written to a config that awg-quick parses, so a value
-// must not be able to add a line such as PostUp to it.
+// Validate accepts only what NewParams can generate. Params can arrive from another
+// machine inside an invite, and the values are written to a config that awg-quick
+// parses, so a value must not be able to add a line such as PostUp to it.
 func (p Params) Validate() error {
-	if p.Jc < 0 || p.Jc > maxJunkCount {
-		return fmt.Errorf("Jc %d is outside 0-%d", p.Jc, maxJunkCount)
-	}
-	if p.Jmin < 0 || p.Jmax > maxJunkSize || p.Jmin > p.Jmax {
-		return fmt.Errorf("Jmin %d and Jmax %d do not form a range within 0-%d", p.Jmin, p.Jmax, maxJunkSize)
-	}
-	for i, s := range []int{p.S1, p.S2, p.S3, p.S4} {
-		if s < minPadding || s > maxPadding {
-			return fmt.Errorf("S%d %d is outside %d-%d", i+1, s, minPadding, maxPadding)
+	for _, field := range []struct {
+		name  string
+		value int
+		want  intRange
+	}{
+		{"Jc", p.Jc, junkCountRange},
+		{"Jmin", p.Jmin, junkMinRange},
+		{"Jmax - Jmin", p.Jmax - p.Jmin, junkSpreadRange},
+		{"S1", p.S1, handshakePaddingRange},
+		{"S2", p.S2, handshakePaddingRange},
+		{"S3", p.S3, cookiePaddingRange},
+		{"S4", p.S4, transportPaddingRange},
+	} {
+		if !field.want.contains(field.value) {
+			return fmt.Errorf("%s %d is outside %d-%d", field.name, field.value, field.want.lo, field.want.hi)
 		}
 	}
 	if handshakeSizesMatch(p.S1, p.S2, p.S3) {
 		return errors.New("S1-S3 give two handshake messages the same size")
 	}
-	for i, h := range []string{p.H1, p.H2, p.H3, p.H4} {
-		if !headerFormat.MatchString(h) {
-			return fmt.Errorf("H%d %q is not a number or a range", i+1, h)
-		}
+	if dataSizeCollides(p.S1, p.S2, p.S3, p.S4) {
+		return errors.New("S1-S4 let a data packet pass for a handshake message")
 	}
 	if !signatureFormat.MatchString(p.I1) {
-		return fmt.Errorf("I1 %q holds something other than the portable tags", p.I1)
+		return fmt.Errorf("I1 %q is not a generated signature packet", p.I1)
 	}
 	if err := ValidateKey(p.HeaderProtectionKey); err != nil {
 		return fmt.Errorf("HeaderProtectionKey: %w", err)
 	}
-	if !paddingFormat.MatchString(p.ContentPaddingAddition) {
-		return fmt.Errorf("ContentPaddingAddition %q is not a number or a range", p.ContentPaddingAddition)
+	// amneziawg-go treats an all-zero key as no key, which would turn protection off.
+	if p.HeaderProtectionKey == zeroKey {
+		return errors.New("HeaderProtectionKey is all zeros")
 	}
 	return nil
 }
 
 // handshakeSizesMatch reports whether two handshake messages end up the same size:
-// init is 148 bytes + S1, response 92 + S2, cookie 64 + S3. The third match,
-// S3 == S1+84, cannot happen within the generated ranges but can in an invite.
+// init is 148 bytes + S1, response 92 + S2, cookie 64 + S3. The third pair cannot
+// match within the ranges above.
 func handshakeSizesMatch(s1, s2, s3 int) bool {
-	return s2 == s1+56 || s3 == s2+28 || s3 == s1+84
+	return s2 == s1+56 || s3 == s2+28
 }
 
 // dataSizeCollides reports whether a receiver can take a data packet for a

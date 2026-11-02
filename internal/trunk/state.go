@@ -11,12 +11,14 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"kalitka/internal/awg"
 )
 
 const (
-	// defaultMTU is what the installer's cascade measured with double encapsulation.
+	// defaultMTU is the value in the installer's cascade guide, measured there with
+	// double encapsulation on AmneziaWG 2.0 and only calculated for 3.1.
 	defaultMTU = 1280
 	// keepalive holds the NAT mapping open on the gateway's side. Home routers can
 	// drop an idle UDP mapping after 30 seconds.
@@ -24,6 +26,9 @@ const (
 	// subnetBits leaves room for 253 gateways on one portal.
 	subnetBits = 24
 )
+
+// subnetRange is where portals pick their subnet from.
+var subnetRange = netip.MustParsePrefix("10.64.0.0/10")
 
 // Tunnel is one interface to bring up.
 type Tunnel struct {
@@ -55,7 +60,7 @@ func NewPortal(name, host string, port int) (*Portal, error) {
 	if !nameFormat.MatchString(name) {
 		return nil, fmt.Errorf("portal name %q is not valid", name)
 	}
-	if err := validateEndpoint(net.JoinHostPort(host, fmt.Sprint(port))); err != nil {
+	if err := awg.ValidateEndpoint(net.JoinHostPort(host, fmt.Sprint(port))); err != nil {
 		return nil, err
 	}
 	return &Portal{
@@ -143,12 +148,9 @@ type PortalLink struct {
 	Invite
 }
 
-// Join adds a portal to the gateway's list.
+// Join adds a portal to the gateway's list. The invite comes from DecodeInvite, which
+// has validated it.
 func (g *Gateway) Join(invite Invite) error {
-	if err := invite.Validate(); err != nil {
-		return fmt.Errorf("invalid invite: %w", err)
-	}
-	used := make(map[string]bool)
 	for _, link := range g.Portals {
 		if link.PortalPublicKey == invite.PortalPublicKey {
 			return fmt.Errorf("portal %q is already joined as %q", invite.Portal, link.Portal)
@@ -158,15 +160,9 @@ func (g *Gateway) Join(invite Invite) error {
 			return fmt.Errorf("subnet %v of portal %q overlaps %v of portal %q; initialise the new portal again to get another subnet",
 				invite.Subnet, invite.Portal, link.Subnet, link.Portal)
 		}
-		used[link.Interface] = true
 	}
-	for i := 0; ; i++ {
-		name := fmt.Sprintf("trunk%d", i)
-		if !used[name] {
-			g.Portals = append(g.Portals, PortalLink{Interface: name, Invite: invite})
-			return nil
-		}
-	}
+	g.Portals = append(g.Portals, PortalLink{Interface: fmt.Sprintf("trunk%d", len(g.Portals)), Invite: invite})
+	return nil
 }
 
 // Tunnels returns one interface per portal. Each has its own keys and parameters,
@@ -174,22 +170,7 @@ func (g *Gateway) Join(invite Invite) error {
 func (g *Gateway) Tunnels() []Tunnel {
 	tunnels := make([]Tunnel, len(g.Portals))
 	for i, link := range g.Portals {
-		portal := portalAddress(link.Subnet)
-		tunnels[i] = Tunnel{
-			Interface: link.Interface,
-			Config: awg.Config{
-				PrivateKey: link.PrivateKey,
-				Address:    netip.PrefixFrom(link.Address, link.Subnet.Bits()),
-				MTU:        link.MTU,
-				Params:     link.Params,
-				Peers: []awg.Peer{{
-					PublicKey:           link.PortalPublicKey,
-					AllowedIPs:          []netip.Prefix{netip.PrefixFrom(portal, portal.BitLen())},
-					Endpoint:            link.Endpoint,
-					PersistentKeepalive: keepalive,
-				}},
-			},
-		}
+		tunnels[i] = Tunnel{Interface: link.Interface, Config: link.config()}
 	}
 	return tunnels
 }
@@ -206,17 +187,19 @@ func Load(path string, state any) error {
 	return nil
 }
 
-// Save writes state atomically, so a crash cannot leave a half-written file with
-// the keys in it. The file holds private keys.
+// Save writes state atomically and durably. The file holds private keys that cannot
+// be regenerated without cutting off every gateway, so neither a crash nor a power
+// cut may leave a half-written or empty file in its place.
 func Save(path string, state any) (err error) {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	file, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err
 	}
@@ -229,10 +212,30 @@ func Save(path string, state any) (err error) {
 		file.Close()
 		return err
 	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), path)
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
+// syncDir makes a rename durable. Windows cannot flush a directory.
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 // portalAddress is the portal's own address: the first host of the trunk subnet.
@@ -251,9 +254,9 @@ func freeAddress(subnet netip.Prefix, used map[netip.Addr]bool) (netip.Addr, err
 	return netip.Addr{}, errors.New("no free gateway address left on this portal")
 }
 
-// randomSubnet picks a /24 in 10.64.0.0/10. A gateway joins several portals that
-// know nothing of each other, and the wide range keeps their subnets apart;
-// Gateway.Join refuses the rare overlap.
+// randomSubnet picks a /24 in subnetRange. A gateway joins several portals that know
+// nothing of each other, and the wide range keeps their subnets apart; Gateway.Join
+// refuses the rare overlap.
 func randomSubnet() netip.Prefix {
 	var b [2]byte
 	rand.Read(b[:]) // Never returns an error: it crashes the program instead.

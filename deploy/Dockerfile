@@ -1,18 +1,23 @@
 # Build from the repository root: docker build -f deploy/Dockerfile -t kalitka .
 #
-# Both engines are pinned, because AmneziaWG generations do not interoperate and an
-# unplanned upgrade could cut off a gateway nobody can reach.
+# Both engines are pinned to a tag and its commit, because AmneziaWG generations do not
+# interoperate and an unplanned upgrade could cut off a gateway nobody can reach. A tag
+# that has moved fails the build. A kernel module on the host is not pinned by this.
 
 FROM golang:1.25.12 AS amneziawg-go
 ARG AMNEZIAWG_GO_REF=v3.1.20260828
-RUN git clone --depth 1 --branch "${AMNEZIAWG_GO_REF}" https://github.com/amnezia-vpn/amneziawg-go.git /src
+ARG AMNEZIAWG_GO_COMMIT=b5928efb6ca19f0153958460c3d141f04abc5c2e
+RUN git clone --depth 1 --branch "${AMNEZIAWG_GO_REF}" https://github.com/amnezia-vpn/amneziawg-go.git /src && \
+    test "$(git -C /src rev-parse HEAD)" = "${AMNEZIAWG_GO_COMMIT}"
 WORKDIR /src
 RUN go mod verify && go build -ldflags '-linkmode external -extldflags "-fno-PIC -static"' -o /out/amneziawg-go
 
 FROM alpine:3.22 AS amneziawg-tools
 ARG AMNEZIAWG_TOOLS_REF=v3.1.20260812
+ARG AMNEZIAWG_TOOLS_COMMIT=ee0f0a9aa34ff0a0da4b3433b9512781cfe02843
 RUN apk add --no-cache git build-base linux-headers && \
     git clone --depth 1 --branch "${AMNEZIAWG_TOOLS_REF}" https://github.com/amnezia-vpn/amneziawg-tools.git /src && \
+    test "$(git -C /src rev-parse HEAD)" = "${AMNEZIAWG_TOOLS_COMMIT}" && \
     make -C /src/src
 
 FROM golang:1.25.12 AS kalitka

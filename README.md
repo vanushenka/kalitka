@@ -31,15 +31,16 @@ docker compose -f deploy/compose.portal.yaml up -d
 ```
 
 The second command prints an invite. It holds a private key, so send it over a
-private channel. On the gateway:
+private channel. On the gateway, run the first command below and paste the invite when
+it asks:
 
 ```sh
-docker compose -f deploy/compose.gateway.yaml run --rm gateway gateway join 'kalitka1....'
+docker compose -f deploy/compose.gateway.yaml run --rm gateway gateway join
 docker compose -f deploy/compose.gateway.yaml up -d
 ```
 
 Repeat the invite and the join for every further portal, and restart the container
-afterwards: a running node loads its state at start.
+afterwards: a running portal or gateway loads its state at start.
 
 Check the trunk on either side:
 
@@ -52,8 +53,10 @@ docker compose -f deploy/compose.gateway.yaml exec gateway awg show
 Go is not required on the host:
 
 ```sh
-docker run --rm -v "$PWD:/src" -w /src golang:1.25.12 go test ./...
+docker run --rm -v "$PWD:/src:ro" -w /src golang:1.25.12 sh -c 'gofmt -l .; go vet ./... && go test ./...'
 ```
+
+`gofmt -l` prints nothing when the formatting is clean.
 
 The end-to-end test builds the image and runs a real trunk through a simulated NAT:
 

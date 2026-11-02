@@ -1,6 +1,8 @@
 package trunk
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"path/filepath"
@@ -66,33 +68,71 @@ func TestInviteRoundTrip(t *testing.T) {
 }
 
 func TestDecodeInviteRejectsMalformed(t *testing.T) {
-	for _, bad := range []string{"", "kalitka2.e30", "kalitka1.", "kalitka1.!!!", "kalitka1.e30", "kalitka1.eyJvdGhlciI6MX0"} {
+	for _, bad := range []string{"", "kalitka2.e30", "kalitka1.", "kalitka1.!!!", "kalitka1.e30"} {
 		if _, err := DecodeInvite(bad); err == nil {
 			t.Errorf("accepted %q", bad)
 		}
 	}
 }
 
+// A field this version does not know might mean something this version does not
+// check. The invite is valid otherwise, so only the unknown field can refuse it.
+func TestDecodeInviteRejectsUnknownFields(t *testing.T) {
+	data, err := json.Marshal(newInvite(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["post_up"] = "id"
+	data, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeInvite(invitePrefix + base64.RawURLEncoding.EncodeToString(data)); err == nil {
+		t.Error("accepted an unknown field")
+	}
+}
+
 // A portal is not trusted, and awg-quick runs PostUp lines as commands, so no field
-// of an invite may be able to add a line to the gateway's config.
+// of an invite may be able to add a line to the gateway's config. Nor may it take over
+// the gateway's routing or switch the protection off.
 func TestDecodeInviteRejectsHostileFields(t *testing.T) {
 	const line = "\nPostUp = id"
 	for name, change := range map[string]func(*Invite){
-		"name":               func(i *Invite) { i.Portal += line },
-		"endpoint":           func(i *Invite) { i.Endpoint = "203.0.113.10" + line + ":39743" },
-		"endpoint zone":      func(i *Invite) { i.Endpoint = "[fe80::1%a" + line + "]:39743" },
-		"endpoint port":      func(i *Invite) { i.Endpoint = "203.0.113.10:39743" + line },
-		"portal key":         func(i *Invite) { i.PortalPublicKey += line },
-		"private key":        func(i *Invite) { i.PrivateKey += line },
-		"I1":                 func(i *Invite) { i.Params.I1 += line },
-		"H1":                 func(i *Invite) { i.Params.H1 += line },
-		"public subnet":      func(i *Invite) { i.Subnet = netip.MustParsePrefix("8.8.8.0/24") },
-		"unmasked subnet":    func(i *Invite) { i.Subnet = netip.PrefixFrom(i.Address, 24) },
+		"name":             func(i *Invite) { i.Portal += line },
+		"no endpoint":      func(i *Invite) { i.Endpoint = "" },
+		"endpoint":         func(i *Invite) { i.Endpoint = "203.0.113.10" + line + ":39743" },
+		"endpoint zone":    func(i *Invite) { i.Endpoint = "[fe80::1%a" + line + "]:39743" },
+		"endpoint port":    func(i *Invite) { i.Endpoint = "203.0.113.10:39743" + line },
+		"portal key":       func(i *Invite) { i.PortalPublicKey += line },
+		"private key":      func(i *Invite) { i.PrivateKey += line },
+		"I1":               func(i *Invite) { i.Params.I1 += line },
+		"I1 huge lengths":  func(i *Invite) { i.Params.I1 = strings.Repeat("<r 9999>", 7) },
+		"no protection":    func(i *Invite) { i.Params.HeaderProtectionKey = "" },
+		"zero protection":  func(i *Invite) { i.Params.HeaderProtectionKey = strings.Repeat("A", 43) + "=" },
+		"padding below 12": func(i *Invite) { i.Params.S4 = 4 },
+		"public subnet":    func(i *Invite) { i.Subnet = netip.MustParsePrefix("8.8.8.0/24") },
+		"unmasked subnet":  func(i *Invite) { i.Subnet = netip.PrefixFrom(i.Address, subnetBits) },
+		// Masked and starting on a private address, yet these cover other networks, and
+		// the interface address would install a route for all of it.
+		"wide private mask":  func(i *Invite) { i.Subnet = netip.MustParsePrefix("10.0.0.0/8") },
+		"mask over public":   func(i *Invite) { i.Subnet = netip.MustParsePrefix("10.0.0.0/7") },
+		"private, off range": func(i *Invite) { i.Subnet = netip.MustParsePrefix("192.168.1.0/24") },
+		"overflowing /32":    func(i *Invite) { i.Subnet = netip.MustParsePrefix("10.127.255.255/32") },
+		"no subnet":          func(i *Invite) { i.Subnet = netip.Prefix{} },
 		"address outside":    func(i *Invite) { i.Address = netip.MustParseAddr("192.168.1.2") },
+		"no address":         func(i *Invite) { i.Address = netip.Addr{} },
 		"portal's address":   func(i *Invite) { i.Address = portalAddress(i.Subnet) },
-		"MTU too small":      func(i *Invite) { i.MTU = minMTU - 1 },
-		"padding below 12":   func(i *Invite) { i.Params.S4 = 4 },
-		"no protection key":  func(i *Invite) { i.Params.HeaderProtectionKey = "" },
+		"network address":    func(i *Invite) { i.Address = i.Subnet.Addr() },
+		"broadcast address": func(i *Invite) {
+			host := i.Subnet.Addr().As4()
+			host[3] = 255
+			i.Address = netip.AddrFrom4(host)
+		},
+		"MTU too small":      func(i *Invite) { i.MTU = 100 },
 		"bad endpoint port":  func(i *Invite) { i.Endpoint = "203.0.113.10:0" },
 		"endpoint with path": func(i *Invite) { i.Endpoint = "example.com/a:39743" },
 	} {
@@ -104,10 +144,6 @@ func TestDecodeInviteRejectsHostileFields(t *testing.T) {
 		}
 		if _, err := DecodeInvite(encoded); err == nil {
 			t.Errorf("%s: accepted", name)
-		}
-		var gateway Gateway
-		if err := gateway.Join(invite); err == nil {
-			t.Errorf("%s: Join accepted", name)
 		}
 	}
 }

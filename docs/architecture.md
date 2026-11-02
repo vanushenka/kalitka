@@ -23,25 +23,30 @@ client ───► portal ◄═══ trunk ═══ gateway ───► int
 
 **We do not write protocols.** The engines are `amneziawg-go` and `amneziawg-tools`,
 later `xray-core`. Kalitka generates their configs and keys, connects machines with an
-invite, watches the tunnels and keeps them up. Engine versions are pinned in
-`deploy/Dockerfile`, because AmneziaWG generations do not interoperate.
+invite, watches the tunnels and keeps them up. Engine versions are pinned to a tag and
+its commit in `deploy/Dockerfile`, because AmneziaWG generations do not interoperate.
 
 **A portal is not trusted.** A rented VPS can be inspected or seized by its host. The
 invite comes from a portal and its values reach a config on the gateway, where
-`awg-quick` runs `PostUp` lines as commands, so `Invite.Validate` checks every field
-strictly and `TestDecodeInviteRejectsHostileFields` holds that in place. Any new field
-of an invite needs the same care. Each trunk has its own keys and parameters, so one
-compromised portal gains nothing on the others.
+`awg-quick` runs `PostUp` lines as commands. So `Invite.Validate` accepts only what a
+portal generates, rather than whatever the engines might take, and
+`TestDecodeInviteRejectsHostileFields` covers the fields that exist today. A new invite
+field needs its own check and test case. `awg.WriteConf` validates every config too, so
+state read from disk gets the same checks. Each trunk has its own keys and parameters,
+so one compromised portal gains nothing on the others.
+
+The invite holds a private key, so `gateway join` reads it from standard input: an
+argument would stay in the shell history and show in the process list.
 
 **One tunnel per portal, one list on the gateway.** The gateway does not care what a
 portal is. A portal that cannot be reached is a normal state: the gateway keeps
 trying, and the other trunks are unaffected.
 
 **Everything lives inside the container.** Interfaces and routes stay in the
-container's network namespace, and `Table = off` keeps `awg-quick` from touching
-routing. That is what lets a node run on any Docker host. Containers need `NET_ADMIN`
-and `/dev/net/tun`, and no kernel module: `awg-quick` uses the module if the host has
-one and falls back to `amneziawg-go`.
+container's network namespace, and `Table = off` keeps `awg-quick` from adding routes
+for the peers. That is what lets a portal or gateway run on any Docker host. Containers
+need `NET_ADMIN` and `/dev/net/tun`, and no kernel module: `awg-quick` uses the module
+if the host has one and falls back to `amneziawg-go`.
 
 **OS-specific code stays in build-tagged files.** Only `internal/awg/tunnel_linux.go`
 touches the system. `tunnel_unsupported.go` makes everything else build on any OS and
@@ -61,9 +66,11 @@ fails loudly when asked to run a tunnel.
 
 `awg.NewParams` follows `generate_awg_params` from
 [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) (MIT), to
-stay within what that project has measured on real networks. Only tags that both the
-kernel module and `amneziawg-go` understand are used. `RandomTrailers` stays off: the
-installer's docs report a sharp drop in speed with it.
+stay within what that project has tried on real networks. `H1`-`H4` and
+`ContentPaddingAddition` are the same for every tunnel, so they are constants in
+`Config.Render` and an invite cannot carry them. Only tags that both the kernel module
+and `amneziawg-go` understand are used. `RandomTrailers` stays off: the installer's docs
+report a sharp drop in speed with it.
 
 Both ends use the same values. Junk packets and `I1` are only sent by the side that
 starts a handshake, normally the gateway.
@@ -107,6 +114,10 @@ per-portal setting, with these rules:
 
 ## Open questions
 
+- **A kernel module on the host.** `awg-quick` prefers it over the pinned `amneziawg-go`,
+  and an older module may refuse a 3.1 config, in which case the tunnel fails on every
+  retry with the error in the log. Not tried yet: the module's source was not checked,
+  and every run so far was on `amneziawg-go`.
 - **Trunk MTU under option A.** A client's encrypted packets travel inside the trunk,
   so a client's MTU has to be lower than the trunk's. The current 1280 comes from a
   cascade of type B. Measure this at stage 2 and raise the trunk MTU if needed.

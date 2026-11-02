@@ -21,10 +21,14 @@ const (
 )
 
 // Run keeps the tunnels up until ctx ends, then removes them. A portal that cannot
-// be reached is a normal state, so Run keeps trying and never gives up on it.
+// be reached is a normal state, so Run keeps trying and never gives up on it. What
+// retrying cannot cure, missing tools or an invalid config, fails here at the start.
 func Run(ctx context.Context, runDir string, tunnels []Tunnel, log *slog.Logger) error {
 	if len(tunnels) == 0 {
 		return errors.New("nothing to run: no trunks are configured")
+	}
+	if err := awg.CheckTools(); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
 		return fmt.Errorf("create %s: %w", runDir, err)
